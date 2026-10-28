@@ -6,12 +6,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import numpy as np
 import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / "islemart_orders_wide.csv"
 REPORT = ROOT / "islemart_order_eda_report.md"
+RFM_OUTPUT = ROOT / "islemart_customer_rfm.csv"
+RFM_REFERENCE_DATE = pd.Timestamp("2025-12-31")
 CHARTS = {
     "monthly": ROOT / "eda_monthly_revenue.png",
     "category": ROOT / "eda_category_revenue.png",
@@ -276,6 +279,92 @@ def make_charts(wide, item_rows, payment_rows):
     return counts, delivered, delivered_items, delivered_payments
 
 
+def make_rfm(wide):
+    delivered = wide.loc[wide["order_status"].eq("delivered")].copy()
+    delivered["purchase_date"] = pd.to_datetime(delivered["order_purchase_timestamp"], errors="coerce").dt.normalize()
+    missing_date = delivered["purchase_date"].isna()
+    future_date = delivered["purchase_date"].gt(RFM_REFERENCE_DATE)
+    missing_person = delivered["customer_unique_id"].isna()
+    eligible = delivered.loc[~(missing_date | future_date | missing_person)].copy()
+    if eligible["recognized_revenue_delivered"].isna().any():
+        raise ValueError("已送達訂單的認列營收有缺值，停止計算 RFM。")
+
+    rfm = eligible.groupby("customer_unique_id", as_index=False).agg(
+        last_purchase_date=("purchase_date", "max"),
+        frequency=("order_id", "nunique"),
+        monetary=("recognized_revenue_delivered", "sum"),
+    )
+    rfm["recency_days"] = (RFM_REFERENCE_DATE - rfm["last_purchase_date"]).dt.days
+
+    for metric, score_name, reverse in (
+        ("recency_days", "R_score", True),
+        ("frequency", "F_score", False),
+        ("monetary", "M_score", False),
+    ):
+        percentile = rfm[metric].rank(method="average", pct=True)
+        score = np.ceil(percentile * 5)
+        rfm[score_name] = (6 - score if reverse else score).astype("int8")
+
+    rfm["total_rfm_score"] = rfm[["R_score", "F_score", "M_score"]].sum(axis=1)
+    score_counts = rfm["total_rfm_score"].value_counts().sort_index()
+    cumulative_share = score_counts.cumsum() / len(rfm)
+    cutoffs = []
+    for quantile in (0.2, 0.4, 0.6, 0.8):
+        remaining = cumulative_share.loc[cumulative_share.index > (cutoffs[-1] if cutoffs else -np.inf)]
+        cutoffs.append(int((remaining - quantile).abs().idxmin()))
+    if len(set(cutoffs)) != 4:
+        raise ValueError("RFM 總分分布無法切成五個不拆同分的群組。")
+
+    minimum_score = int(score_counts.index.min())
+    maximum_score = int(score_counts.index.max())
+    boundaries = [-np.inf, *cutoffs, np.inf]
+    def format_score_range(lower, upper):
+        return f"{lower}分" if lower == upper else f"{lower}–{upper}分"
+
+    score_ranges = [
+        format_score_range(minimum_score, cutoffs[0]),
+        *[format_score_range(lower + 1, upper) for lower, upper in zip(cutoffs, cutoffs[1:])],
+        format_score_range(cutoffs[-1] + 1, maximum_score),
+    ]
+    segment_names = ["低分喚回", "待培養", "一般客提升", "高潛力培養", "高價值維繫"]
+    segments = [f"{name}（{score_range}）" for name, score_range in zip(segment_names, score_ranges)]
+    rfm["segment"] = pd.cut(
+        rfm["total_rfm_score"],
+        bins=boundaries,
+        labels=segments,
+        include_lowest=True,
+    )
+    if rfm["segment"].isna().any() or rfm["segment"].nunique() != 5:
+        raise ValueError("RFM 五群分組未涵蓋所有顧客或產生空群。")
+
+    recommendations = [
+        "以低門檻回購優惠或喚回訊息測試是否仍有需求。",
+        "依首購品項推薦互補商品，搭配限期第二次購買誘因。",
+        "提供補貨提醒與個人化加購，逐步提高回購率。",
+        "以會員點數或組合優惠促成近期第二筆訂單。",
+        "提供 VIP 服務、新品優先體驗與專屬關懷，著重留存而非全面折扣。",
+    ]
+    summary = rfm.groupby("segment", observed=True).agg(
+        customer_count=("customer_unique_id", "size"),
+        average_recency_days=("recency_days", "mean"),
+        average_frequency=("frequency", "mean"),
+        average_spend=("monetary", "mean"),
+        average_R_score=("R_score", "mean"),
+        average_F_score=("F_score", "mean"),
+        average_M_score=("M_score", "mean"),
+    )
+    summary["share"] = summary["customer_count"] / len(rfm)
+    summary["recommendation"] = recommendations
+    exclusions = {
+        "delivered_orders": len(delivered),
+        "non_delivered_orders": len(wide) - len(delivered),
+        "missing_purchase_date": int(missing_date.sum()),
+        "after_reference_date": int(future_date.sum()),
+        "missing_customer_unique_id": int(missing_person.sum()),
+    }
+    return rfm, summary, exclusions
+
+
 def compute_quality(tables, wide, products, duplicate_count):
     untranslated = products["product_category_name"].notna() & products["product_category_name_english"].isna()
     return [
@@ -288,7 +377,7 @@ def compute_quality(tables, wide, products, duplicate_count):
     ]
 
 
-def write_report(tables, wide, ledger, chart_counts, quality, duplicate_examples):
+def write_report(tables, wide, ledger, chart_counts, quality, duplicate_examples, rfm, rfm_summary, rfm_exclusions):
     lines = [
         "# 訂單寬表與 EDA 執行報告",
         "",
@@ -334,6 +423,26 @@ def write_report(tables, wide, ledger, chart_counts, quality, duplicate_examples
     ]
     lines.extend(["| 圖表 | 處理前 | 納入分析 | 排除筆數 | 說明 |", "|---|---:|---:|---:|---|"])
     lines.extend(f"| {name} | {before:,} | {included:,} | {excluded:,} | {detail} |" for name, before, included, excluded, detail in eda_rows)
+    lines.extend([
+        "",
+        "## RFM 顧客分群",
+        "",
+        f"基準日：{RFM_REFERENCE_DATE:%Y-%m-%d}。同一人以 `customer_unique_id` 合併；Recency 為基準日減最後下單日的日曆天數，Frequency 為已送達訂單數，Monetary 為已送達訂單 `recognized_revenue_delivered` 加總（商品售價 + 運費）。",
+        "僅納入基準日當天或之前的已送達訂單；不納入非已送達訂單。各維度以顧客百分位排名切成 1–5 分，並保留同值同分；Recency 方向反轉（越近期分數越高）。以 R+F+M 總分切五群，分界取最接近各 20% 累積比例且不拆同分的總分界線。",
+        f"樣本：{rfm_exclusions['delivered_orders']:,} 筆已送達訂單、{len(rfm):,} 位顧客；非已送達訂單排除 {rfm_exclusions['non_delivered_orders']:,} 筆，已送達訂單中缺下單日期 {rfm_exclusions['missing_purchase_date']:,} 筆、晚於基準日 {rfm_exclusions['after_reference_date']:,} 筆、缺 `customer_unique_id` {rfm_exclusions['missing_customer_unique_id']:,} 筆。",
+        "平均消費為該群每位顧客累計已送達消費額的平均值；金額維持資料原始單位，資料未提供幣別，故不標示幣別。",
+        "",
+        "| 群組（RFM 總分） | 人數 | 占比 | 平均 R 分 | 平均 F 分 | 平均 M 分 | 平均已送達訂單數 | 平均消費 | 行銷建議 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+    ])
+    lines.extend(
+        f"| {segment} | {int(row.customer_count):,} | {row.share:.1%} | {row.average_R_score:.2f} | {row.average_F_score:.2f} | {row.average_M_score:.2f} | {row.average_frequency:.2f} | {row.average_spend:,.2f} | {row.recommendation} |"
+        for segment, row in rfm_summary.iterrows()
+    )
+    lines.extend([
+        "",
+        f"逐顧客 RFM 明細：`{RFM_OUTPUT.name}`（{len(rfm):,} 位顧客，含各維度分數與分群）。",
+    ])
     lines.extend(["", "| 圖表 | 檔案 |", "|---|---|"])
     chart_titles = {
         "monthly": "月營收趨勢",
@@ -357,10 +466,13 @@ def main():
     wide.to_csv(OUTPUT, index=False, encoding="utf-8-sig")
 
     chart_counts, _, _, _ = make_charts(wide, item_rows, payment_rows)
+    rfm, rfm_summary, rfm_exclusions = make_rfm(wide)
+    rfm.to_csv(RFM_OUTPUT, index=False, encoding="utf-8-sig")
     quality = compute_quality(tables, wide, products, duplicate_count)
-    write_report(tables, wide, ledger, chart_counts, quality, duplicate_examples)
+    write_report(tables, wide, ledger, chart_counts, quality, duplicate_examples, rfm, rfm_summary, rfm_exclusions)
     print(f"寬表：{OUTPUT.name} ({len(wide):,} rows, {wide['order_id'].nunique():,} unique orders)")
     print(f"報告：{REPORT.name}")
+    print(f"RFM 明細：{RFM_OUTPUT.name} ({len(rfm):,} customers)")
     print("圖表：" + ", ".join(path.name for path in CHARTS.values()))
     print(f"精確重複評論排除：{duplicate_count:,}")
     for name, before, included, excluded in [
